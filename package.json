@@ -1,0 +1,1 @@
+{"description":"A GitHub-compatible git forge: git smart HTTP, REST v3, GraphQL and MCP from one deterministic in-memory store (make.fun github-core-clone-01)","engines":{"node":">=22.18"},"license":"MIT","name":"git-forge","private":true,"scripts":{"start":"node --experimental-strip-types main.ts"},"type":"module","version":"1.0.0"}
