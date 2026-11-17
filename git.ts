@@ -61,7 +61,9 @@ export function parsePktLines(buf: Buffer, offset = 0): { items: PktItem[]; next
       continue;
     }
     if (pos + length > buf.length) break;
-    items.push({ kind: 'data', data: Buffer.from(buf.subarray(pos + 4, pos + length)) });
+    // A view, not a copy: every caller reads the item (toString) synchronously
+    // inside this request, and the body buffer outlives the request.
+    items.push({ kind: 'data', data: buf.subarray(pos + 4, pos + length) });
     pos += length;
   }
   return { items, next: pos };
@@ -763,18 +765,37 @@ function receivePackResponse(repo: Repo, commands: PushCommand[], objects: Map<s
     repo.lsCache.clear();
     repo.packCache.clear();
   }
-  const report = Buffer.concat([
-    pktLine('unpack ok\n'),
-    ...results.map((line) => pktLine(line)),
-    // The report-status stream ends with its own flush inside the band-1 payload;
-    // without it the client reads the lines and then reports a hangup while
-    // waiting for the stream to terminate.
-    PKT_FLUSH,
-  ]);
-  // The report-status stream is itself a pkt-line stream carried inside the
-  // band-1 sideband payload; raw "unpack ok\n" text is not a pkt-line and the
-  // client rejects it ("bad line length character: unpa").
-  return Buffer.concat([sideband(report), PKT_FLUSH]);
+  const report = reportStatusResponse(results);
+  return report;
+}
+
+/**
+ * The report-status response in a single allocation: the report's pkt-lines
+ * ('unpack ok' + one per ref + a flush) inside one band-1 sideband frame,
+ * plus the terminating flush. Byte-identical to the pktLine/sideband build.
+ */
+function reportStatusResponse(results: string[]): Buffer {
+  const lines = ['unpack ok\n', ...results];
+  let innerLen = 4; // the report's own terminating flush
+  for (const line of lines) innerLen += 4 + Buffer.byteLength(line);
+  const totalLen = 4 + 1 + innerLen + 4; // sideband header + band byte + report + final flush
+  const out = Buffer.alloc(totalLen);
+  let pos = 0;
+  const writeLen = (len: number): void => {
+    out.write(len.toString(16).padStart(4, '0'), pos, 4, 'ascii');
+    pos += 4;
+  };
+  writeLen(4 + 1 + innerLen); // the sideband frame's pkt-line length
+  out[pos] = 1; // band 1 (progress/data)
+  pos += 1;
+  for (const line of lines) {
+    writeLen(4 + Buffer.byteLength(line));
+    pos += out.write(line, pos, 'utf8');
+  }
+  out.write('0000', pos, 4, 'ascii'); // report flush
+  pos += 4;
+  out.write('0000', pos, 4, 'ascii'); // final flush
+  return out;
 }
 
 /** True when `next` descends from `current` (or is a tag pointing at such a commit). */

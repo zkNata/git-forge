@@ -27,29 +27,67 @@ import { handleMcp } from './mcp.ts';
 
 const MAX_BODY_BYTES = 64 * 1024 * 1024;
 
+/** Shared empty values: the hot paths build them per request otherwise. */
+const EMPTY_BODY = Buffer.alloc(0);
+const EMPTY_QUERY = new URLSearchParams('');
+
+/**
+ * Resolve the body early when the first chunk already holds it all: a small
+ * POST (bench pushes, issue creates) arrives in one TCP segment, so waiting
+ * for the 'end' event costs an extra event-loop turn for nothing. When the
+ * body is chunked or has no Content-Length, fall back to waiting for 'end'.
+ * The bytes delivered are identical either way.
+ */
 function readBody(req: IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
+    const contentLength = Number(req.headers['content-length'] ?? NaN);
     const chunks: Buffer[] = [];
     let total = 0;
-    req.on('data', (chunk: Buffer) => {
+    let settled = false;
+    const cleanup = (): void => {
+      // Keep the 'error' listener attached: an 'error' event with no listener
+      // throws, and a socket error can still arrive after the body is read.
+      // onError is a no-op once settled.
+      req.removeListener('data', onData);
+      req.removeListener('end', onEnd);
+    };
+    const onData = (chunk: Buffer): void => {
       total += chunk.length;
       if (total > MAX_BODY_BYTES) {
+        settled = true;
+        cleanup();
         reject(new Error('request body too large'));
         return;
       }
       chunks.push(chunk);
-    });
-    req.on('end', () => resolve(Buffer.concat(chunks)));
-    req.on('error', reject);
+      if (!settled && Number.isFinite(contentLength) && total >= contentLength) {
+        settled = true;
+        cleanup();
+        resolve(chunks.length === 1 ? chunks[0]! : Buffer.concat(chunks));
+      }
+    };
+    const onEnd = (): void => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(Buffer.concat(chunks));
+    };
+    const onError = (err: Error): void => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(err);
+    };
+    req.on('data', onData);
+    req.on('end', onEnd);
+    req.on('error', onError);
   });
 }
 
-function lowerHeaders(req: IncomingMessage): Record<string, string | undefined> {
-  const out: Record<string, string | undefined> = {};
-  for (const [key, value] of Object.entries(req.headers)) {
-    out[key] = Array.isArray(value) ? value[0] : value;
-  }
-  return out;
+/** One request header, first value when repeated (Node lower-cases the names). */
+function headerValue(req: IncomingMessage, name: string): string | undefined {
+  const value = req.headers[name];
+  return Array.isArray(value) ? value[0] : value;
 }
 
 function sendJson(res: ServerResponse, store: Store, status: number, body: unknown, headers?: Record<string, string>): void {
@@ -68,10 +106,13 @@ function sendBuffer(res: ServerResponse, store: Store, status: number, contentTy
 }
 
 async function handleRequest(store: Store, req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const url = new URL(req.url ?? '/', 'http://localhost');
-  const pathname = url.pathname;
+  // Split the request-target by hand: `new URL()` costs ~2-4 us per request
+  // and the handlers only need the pathname plus, rarely, one query value.
+  const rawUrl = req.url ?? '/';
+  const qIndex = rawUrl.indexOf('?');
+  const pathname = qIndex < 0 ? rawUrl : rawUrl.slice(0, qIndex);
+  const queryString = qIndex < 0 ? '' : rawUrl.slice(qIndex + 1);
   const method = (req.method ?? 'GET').toUpperCase();
-  const headers = lowerHeaders(req);
 
   // The boot probe: no auth, no body.
   if (pathname === '/healthz') {
@@ -95,7 +136,7 @@ async function handleRequest(store: Store, req: IncomingMessage, res: ServerResp
 
   // Auth (REST, GraphQL, MCP only): the exact shop token when set, else any Bearer.
   if (!isGitPath) {
-    const authorization = headers.authorization ?? '';
+    const authorization = headerValue(req, 'authorization') ?? '';
     const match = /^Bearer (.+)$/.exec(authorization);
     const token = match?.[1] ?? '';
     if (token === '' || (store.token !== '' && token !== store.token)) {
@@ -104,11 +145,18 @@ async function handleRequest(store: Store, req: IncomingMessage, res: ServerResp
     }
   }
 
-  const rawBody = method === 'GET' || method === 'HEAD' ? Buffer.alloc(0) : await readBody(req);
+  const rawBody = method === 'GET' || method === 'HEAD' ? EMPTY_BODY : await readBody(req);
 
   try {
     if (isGitPath) {
-      const result = handleGit(store, method, pathname.slice(1), url.searchParams, headers, rawBody);
+      const result = handleGit(
+        store,
+        method,
+        pathname.slice(1),
+        queryString === '' ? EMPTY_QUERY : new URLSearchParams(queryString),
+        { 'git-protocol': headerValue(req, 'git-protocol') },
+        rawBody,
+      );
       sendBuffer(res, store, result.status, result.contentType, result.body);
       return;
     }
@@ -149,10 +197,10 @@ async function handleRequest(store: Store, req: IncomingMessage, res: ServerResp
     const ctx: RestContext = {
       store,
       viewer: VIEWER_LOGIN,
-      origin: `http://${headers.host ?? 'localhost'}`,
+      origin: `http://${headerValue(req, 'host') ?? 'localhost'}`,
     };
     const restPath = pathname.slice('/api/v3'.length);
-    const result = handleRest(ctx, method, restPath, url.searchParams, jsonBody);
+    const result = handleRest(ctx, method, restPath, queryString === '' ? EMPTY_QUERY : new URLSearchParams(queryString), jsonBody);
     if (result.status === 204) {
       res.writeHead(204, { 'x-github-request-id': store.nextRequestId(), ...(result.headers ?? {}) });
       res.end();
